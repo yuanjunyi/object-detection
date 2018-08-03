@@ -148,12 +148,64 @@ class TinySSD(nn.Block):
                 concat_preds(bbox_preds))
 
 
-if __name__ == '__main__':
-    net = TinySSD(num_classes=2)
-    net.initialize()
-    x = nd.zeros((2, 3, 256, 256))
-    anchors, cls_preds, bbox_preds = net(x)
+def calc_loss(cls_preds, cls_labels, bbox_preds, bbox_labels, bbox_masks):
+    cls_loss = gloss.SoftmaxCrossEntropyLoss()
+    bbox_loss = gloss.L1Loss()
+    cls = cls_loss(cls_preds, cls_labels)
+    bbox = bbox_loss(bbox_preds * bbox_masks, bbox_labels * bbox_masks)
+    return cls + bbox
 
-    print('output achors:', anchors.shape)
-    print('output class predictions:', cls_preds.shape)
-    print('output box predictions:', bbox_preds.shape)
+
+def cls_metric(cls_preds, cls_labels):
+    return (cls_preds.argmax(axis=-1) == cls_labels).mean().asscalar()
+
+
+def bbox_metric(bbox_preds, bbox_labels, bbox_masks):
+    return (bbox_labels - bbox_preds * bbox_masks).abs().mean().asscalar()
+
+
+if __name__ == '__main__':
+    batch_size = 32
+    train_data, test_data = gb.load_data_pikachu(batch_size)
+    '''
+    train_data.data_shape is (3, 256, 256)
+    test_data.data_shape is (1, 5)
+
+    1 is the number of bbox in each image in pikachu dataset.
+    We need to make sure each image has the same number of bbox.
+    For those have fewer bboxes, fill illegal bbox to reach this number
+    so that images can be processed in batch.
+
+    Each bbox has 5 elements [class, x, y, x, y]. class -1 represnets
+    illegal.
+
+    Each image is required to have at least 3 bbox in GPU implementation.
+    '''
+    train_data.reshape(label_shape=(3, 5))
+    ctx = gb.try_gpu()
+    net = TinySSD(num_classes=2)
+    net.initialize(init=init.Xavier(), ctx=ctx)
+    trainer = gluon.Trainer(net.collect_params(),
+                            'sgd', {'learning_rate': 0.1, 'wd': 5e-4})
+
+    for epoch in range(5):
+        acc, mae = 0, 0
+        train_data.reset()  # Resets the iterator to the beginning of the data.
+        tic = time.time()
+        for i, batch in enumerate(train_data):
+            # batch.data is a list of length 1
+            X = batch.data[0].as_in_context(ctx)
+            Y = batch.label[0].as_in_context(ctx)
+            with autograd.record():
+                anchors, cls_preds, bbox_preds = net(X)
+                bbox_labels, bbox_masks, cls_labels = contrib.nd.MultiBoxTarget(
+                    anchors, Y, cls_preds.transpose(axes=(0, 2, 1)))
+                l = calc_loss(cls_preds, cls_labels,
+                              bbox_preds, bbox_labels, bbox_masks)
+
+            l.backward()
+            trainer.step(batch_size)
+            acc += cls_metric(cls_preds, cls_labels)
+            mae += bbox_metric(bbox_preds, bbox_labels, bbox_masks)
+        print('epoch %d, class err %.2e, bbox mae %.2e, time %.1f sec' %
+              (epoch, 1 - acc / (i + 1), mae / (i + 1), time.time() - tic))
