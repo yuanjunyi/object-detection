@@ -37,7 +37,11 @@ def flatten_pred(pred):
     transfer it to a 2d array of batch_size row and height*width*channels column.
 
     E.g. batch_size = 1, channels=3, height=2, width=3
-    Without transpose, pred looks like:
+
+    =================
+    Without transpose
+    =================
+    pred looks like:
     R1 R2 R3
     R4 R5 R6
 
@@ -50,7 +54,10 @@ def flatten_pred(pred):
     flattened looks like:
     R1 R2 R3 R4 R5 R6 G1 G2 G3 G4 G5 G6 B1 B2 B3 B4 B5 B6
 
-    With transpose(axes=(0, 2, 3, 1)), pred looks like
+    =================================
+    With transpose(axes=(0, 2, 3, 1))
+    =================================
+    pred looks like
     (R1,G1,B1) (R2,G2,B2) (R3,G3,B3)
     (R4,G4,B4) (R5,G5,B5) (R6,G6,B6)
 
@@ -127,8 +134,13 @@ class TinySSD(nn.Block):
         super(TinySSD, self).__init__(**kwargs)
         self.num_classes = num_classes
         self.num_anchors = 4
-        self.sizes = [[0.2, 0.272], [0.37, 0.447],
-                      [0.54, 0.619], [0.71, 0.79], [0.88, 0.961]]
+        self.sizes = [
+            [0.2, 0.272],
+            [0.37, 0.447],
+            [0.54, 0.619],
+            [0.71, 0.79],
+            [0.88, 0.961]
+        ]
         self.ratios = [[1, 2, 0.5]] * 5
 
         for i in range(5):
@@ -138,11 +150,27 @@ class TinySSD(nn.Block):
             setattr(self, 'bbox_%d' % i, bbox_predictor(self.num_anchors))
 
     def forward(self, x):
+        '''
+        Returns
+        1. anchors of shape
+           [batch_size, total number of anchors per batch, 4]
+
+        2. class predictions of shape
+           [batch_size, total number of anchors per batch, num_classes + 1]
+
+        3. bbox predictions of shape
+           [batch_size, total number of anchors per batch * 4]
+        '''
         anchors, cls_preds, bbox_preds = [None] * 5, [None] * 5, [None] * 5
         for i in range(5):
-            x, anchors[i], cls_preds[i], bbox_preds[i] = single_scale_forward(
-                x, getattr(self, 'blk_%d' % i), self.sizes[i], self.ratios[i],
-                getattr(self, 'cls_%d' % i), getattr(self, 'bbox_%d' % i))
+            x, anchors[i], cls_preds[i], bbox_preds[i] = \
+                single_scale_forward(x,
+                                     getattr(self, 'blk_%d' % i),
+                                     self.sizes[i],
+                                     self.ratios[i],
+                                     getattr(self, 'cls_%d' % i),
+                                     getattr(self, 'bbox_%d' % i))
+
         return (nd.concat(*anchors, dim=1),
                 concat_preds(cls_preds).reshape((0, -1, self.num_classes + 1)),
                 concat_preds(bbox_preds))
@@ -150,17 +178,29 @@ class TinySSD(nn.Block):
 
 def calc_loss(cls_preds, cls_labels, bbox_preds, bbox_labels, bbox_masks):
     cls_loss = gloss.SoftmaxCrossEntropyLoss()
-    bbox_loss = gloss.L1Loss()
     cls = cls_loss(cls_preds, cls_labels)
+    bbox_loss = gloss.L1Loss()
     bbox = bbox_loss(bbox_preds * bbox_masks, bbox_labels * bbox_masks)
     return cls + bbox
 
 
 def cls_metric(cls_preds, cls_labels):
+    '''
+    cls_preds from TinySSD's forward has the shape
+    [batch_size, total number of anchors per batch, num_classes + 1],
+    so pass axis=-1 to argmax.
+
+    cls_labels has the shape
+    [batch_size, total number of anchors per batch]
+    '''
     return (cls_preds.argmax(axis=-1) == cls_labels).mean().asscalar()
 
 
 def bbox_metric(bbox_preds, bbox_labels, bbox_masks):
+    '''
+    All the inputs have the shape
+    [batch_size, total number of anchors per batch * 4]
+    '''
     return (bbox_labels - bbox_preds * bbox_masks).abs().mean().asscalar()
 
 
@@ -198,10 +238,17 @@ if __name__ == '__main__':
             Y = batch.label[0].as_in_context(ctx)
             with autograd.record():
                 anchors, cls_preds, bbox_preds = net(X)
-                bbox_labels, bbox_masks, cls_labels = contrib.nd.MultiBoxTarget(
-                    anchors, Y, cls_preds.transpose(axes=(0, 2, 1)))
-                l = calc_loss(cls_preds, cls_labels,
-                              bbox_preds, bbox_labels, bbox_masks)
+                # shape of transposed cls_preds
+                # [batch_size, num_classes + 1, total number of anchors per batch]
+                bbox_labels, bbox_masks, cls_labels = \
+                    contrib.nd.MultiBoxTarget(anchors,
+                                              Y,
+                                              cls_preds.transpose(axes=(0, 2, 1)))
+                l = calc_loss(cls_preds,
+                              cls_labels,
+                              bbox_preds,
+                              bbox_labels,
+                              bbox_masks)
 
             l.backward()
             trainer.step(batch_size)
